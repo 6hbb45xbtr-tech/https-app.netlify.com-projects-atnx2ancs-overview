@@ -1,0 +1,266 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Offline MP3 Downloader (Browser — DuckDuckGo friendly)</title>
+  <style>
+    :root { --pad: 12px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif; }
+    body { margin: 0; background: #f6f7f8; color: #111; }
+    header { padding: var(--pad); background: #fff; border-bottom: 1px solid #e6e6e6; position: sticky; top: 0; }
+    h1 { font-size: 1.1rem; margin: 0; }
+    main { padding: var(--pad); max-width: 960px; margin: 0 auto; }
+    section { background: #fff; border: 1px solid #e6e6e6; border-radius: 10px; padding: var(--pad); margin-bottom: var(--pad); }
+    textarea { width: 100%; min-height: 140px; border-radius: 8px; border: 1px solid #d0d0d0; padding: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .grow { flex: 1 1 auto; }
+    .btn { padding: 10px 14px; border-radius: 9px; border: 1px solid #d0d0d0; background: #fff; cursor: pointer; font-weight: 600; }
+    .btn.primary { background: #0a84ff; color: #fff; border-color: #0a84ff; }
+    .btn[disabled] { opacity: .5; cursor: not-allowed; }
+    .hint { color: #555; font-size: .9rem; }
+    .url-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; margin-top: 8px; }
+    .chip { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px; border: 1px solid #e2e2e2; border-radius: 999px; background: #fafafa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chip a { text-decoration: none; color: #0a84ff; font-weight: 600; }
+    .log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9rem; white-space: pre-wrap; background: #0b0c10; color: #e6e6e6; padding: 10px; border-radius: 8px; min-height: 100px; }
+    .card { border: 1px solid #e6e6e6; border-radius: 10px; padding: 10px; background: #fff; }
+    .status-ok { color: #0a7d2e; }
+    .status-err { color: #b00020; }
+    footer { text-align: center; color: #888; padding: 16px; }
+    .small { font-size: .85rem; color: #666; }
+  </style>
+</head>
+<body>
+  <header><h1>Offline MP3 Downloader — Browser edition (DuckDuckGo compatible)</h1></header>
+  <main>
+    <section>
+      <p class="hint">Paste one URL per line. This page does not send URLs anywhere — everything runs in your browser.</p>
+      <textarea id="urls" placeholder="https://example.com/song1.mp3&#10;https://example.com/song2.mp3"></textarea>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn" id="sample">Use Sample</button>
+        <button class="btn" id="clear">Clear</button>
+        <div class="grow"></div>
+        <button class="btn" id="makeLinks">Generate Download Buttons</button>
+        <button class="btn primary" id="zipBtn">Try Fetch & ZIP (best effort)</button>
+      </div>
+      <p class="small">Note: Direct downloads (buttons below) are the most reliable on mobile DuckDuckGo. The ZIP option tries to fetch files and make a ZIP locally — this may be blocked by CORS on some sites.</p>
+    </section>
+
+    <section>
+      <h3 style="margin-top:0;">Direct Download Buttons</h3>
+      <div id="links" class="url-list"></div>
+    </section>
+
+    <section>
+      <h3 style="margin-top:0;">Log</h3>
+      <div class="log" id="log"></div>
+    </section>
+  </main>
+  <footer>Download legally. You are responsible for the content you save.</footer>
+
+<script>
+// ---------- Utilities ----------
+const $ = (sel) => document.querySelector(sel);
+const logEl = $("#log");
+function log(msg) {
+  logEl.textContent += msg + "\\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function cleanLines(s) {
+  return (s || "").split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
+}
+function suggestName(url) {
+  try {
+    const u = new URL(url);
+    const name = u.pathname.split("/").pop() || "audio.mp3";
+    return name.toLowerCase().endsWith(".mp3") ? name : name + ".mp3";
+  } catch { return "audio.mp3"; }
+}
+function saveBlob(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+
+// ---------- CRC32 + ZIP (store only) ----------
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let crc = 0xFFFFFFFF >>> 0;
+  const u8 = new Uint8Array(buf);
+  for (let i = 0; i < u8.length; i++) {
+    const byte = u8[i];
+    crc = CRC_TABLE[(crc ^ byte) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function u16(n) { return new Uint8Array([n & 0xFF, (n >> 8) & 0xFF]); }
+function u32(n) { return new Uint8Array([n & 0xFF, (n >> 8) & 0xFF, (n >> 16) & 0xFF, (n >> 24) & 0xFF]); }
+
+async function makeZip(entries) {
+  // entries: [{name, data:ArrayBuffer}]
+  const chunks = [];
+  let offset = 0;
+  let central = [];
+
+  function push(arr) { chunks.push(arr); offset += arr.length; }
+
+  for (const e of entries) {
+    const nameBytes = new TextEncoder().encode(e.name);
+    const data = new Uint8Array(e.data);
+    const crc = crc32(data);
+    const size = data.length;
+
+    // local file header
+    const head = new Uint8Array(30 + nameBytes.length);
+    head.set([0x50,0x4B,0x03,0x04], 0);        // sig
+    head.set(u16(20), 4);                      // version
+    head.set(u16(0), 6);                       // flags
+    head.set(u16(0), 8);                       // method = store
+    head.set(u16(0), 10);                      // time
+    head.set(u16(0), 12);                      // date
+    head.set(u32(crc), 14);                    // crc
+    head.set(u32(size), 18);                   // comp size
+    head.set(u32(size), 22);                   // uncmp size
+    head.set(u16(nameBytes.length), 26);       // name len
+    head.set(u16(0), 28);                      // extra len
+    head.set(nameBytes, 30);                   // name
+
+    push(head);
+    push(data);
+
+    // central directory header
+    const cent = new Uint8Array(46 + nameBytes.length);
+    cent.set([0x50,0x4B,0x01,0x02], 0);        // sig
+    cent.set(u16(20), 4);                      // version made
+    cent.set(u16(20), 6);                      // version need
+    cent.set(u16(0), 8);                       // flags
+    cent.set(u16(0), 10);                      // method
+    cent.set(u16(0), 12);                      // time
+    cent.set(u16(0), 14);                      // date
+    cent.set(u32(crc), 16);                    // crc
+    cent.set(u32(size), 20);                   // comp size
+    cent.set(u32(size), 24);                   // uncmp size
+    cent.set(u16(nameBytes.length), 28);       // name len
+    cent.set(u16(0), 30);                      // extra len
+    cent.set(u16(0), 32);                      // comment len
+    cent.set(u16(0), 34);                      // disk #
+    cent.set(u16(0), 36);                      // int attrs
+    cent.set(u32(0), 38);                      // ext attrs
+    cent.set(u32(offset - (head.length + size)), 42); // local header offset
+    cent.set(nameBytes, 46);
+    central.push(cent);
+  }
+
+  let centralSize = 0;
+  for (const c of central) centralSize += c.length;
+  const centralStart = offset;
+
+  for (const c of central) push(c);
+
+  const end = new Uint8Array(22);
+  end.set([0x50,0x4B,0x05,0x06], 0);           // end sig
+  end.set(u16(0), 4);                          // disk no
+  end.set(u16(0), 6);                          // start disk
+  end.set(u16(entries.length), 8);             // entries on disk
+  end.set(u16(entries.length), 10);            // total entries
+  end.set(u32(centralSize), 12);               // size of central
+  end.set(u32(centralStart), 16);              // offset of central
+  end.set(u16(0), 20);                         // comment len
+  push(end);
+
+  // concat
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const out = new Uint8Array(totalLen);
+  let p = 0;
+  for (const c of chunks) { out.set(c, p); p += c.length; }
+  return new Blob([out], { type: "application/zip" });
+}
+
+// ---------- UI actions ----------
+$("#sample").addEventListener("click", () => {
+  $("#urls").value = "https://file-examples.com/storage/fe93f87b9f7c9a2e07f6b1e/2017/11/file_example_MP3_700KB.mp3";
+});
+
+$("#clear").addEventListener("click", () => $("#urls").value = "");
+
+$("#makeLinks").addEventListener("click", () => {
+  const urls = cleanLines($("#urls").value);
+  const wrap = $("#links");
+  wrap.innerHTML = "";
+  if (!urls.length) { log("No URLs."); return; }
+  urls.forEach(u => {
+    const name = suggestName(u);
+    const div = document.createElement("div");
+    div.className = "chip";
+    const a = document.createElement("a");
+    a.href = u;
+    a.textContent = "Download";
+    a.rel = "noopener noreferrer";
+    a.target = "_blank";
+    const lbl = document.createElement("span");
+    lbl.textContent = name;
+    div.appendChild(lbl);
+    div.appendChild(a);
+    wrap.appendChild(div);
+  });
+  log(`Created ${urls.length} direct download buttons.`);
+});
+
+$("#zipBtn").addEventListener("click", async () => {
+  const urls = cleanLines($("#urls").value);
+  if (!urls.length) { log("No URLs to fetch."); return; }
+  const fetched = [];
+  const failed = [];
+  log("Fetching files (may fail due to CORS on some servers)...");
+
+  for (const u of urls) {
+    const name = suggestName(u);
+    try {
+      const res = await fetch(u, { mode: "cors" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const ct = res.headers.get("Content-Type") || "";
+      if (!ct.toLowerCase().startsWith("audio")) {
+        console.warn("Non-audio content-type:", ct);
+      }
+      const buf = await res.arrayBuffer();
+      fetched.push({ name, data: buf });
+      log(`OK: ${name} (${Math.round(buf.byteLength/1024)} KB)`);
+    } catch (e) {
+      failed.push({ url: u, err: String(e) });
+      log(`ERR: ${name} — ${e}`);
+    }
+  }
+
+  if (!fetched.length) {
+    log("Nothing fetched; creating a URL list you can save.");
+    const txt = urls.join("\\n");
+    saveBlob(new Blob([txt], {type:"text/plain"}), "mp3_urls.txt");
+    return;
+  }
+
+  log("Building ZIP...");
+  try {
+    const zip = await makeZip(fetched);
+    saveBlob(zip, "mp3_downloads.zip");
+    log("ZIP ready. If some files failed due to CORS, use the direct buttons above for those.");
+  } catch (e) {
+    log("Failed to build ZIP: " + e);
+  }
+});
+</script>
+</body>
+</html>
